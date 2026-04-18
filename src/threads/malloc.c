@@ -107,7 +107,7 @@ void* malloc(size_t size) {
     a->magic = ARENA_MAGIC;
     a->desc = NULL;
     a->free_cnt = page_cnt;
-    return a + 1;
+    return a + 1; // the 0 ~ sizeof arena is for metadata
   }
 
   lock_acquire(&d->lock);

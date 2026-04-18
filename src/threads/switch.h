@@ -1,6 +1,7 @@
 #ifndef THREADS_SWITCH_H
 #define THREADS_SWITCH_H
 
+#include <stdint.h>
 #ifndef __ASSEMBLER__
 /* switch_thread()'s stack frame. */
 struct switch_threads_frame {

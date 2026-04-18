@@ -8,6 +8,8 @@
 // These defines will be used in Project 2: Multithreading
 #define MAX_STACK_PAGES (1 << 11)
 #define MAX_THREADS 127
+#define MAX_ARGC 100
+#define MAX_FDS 128
 
 /* PIDs and TIDs are the same type. PID should be
    the TID of the main thread of the process */
@@ -27,8 +29,44 @@ struct process {
   uint32_t* pagedir;          /* Page directory. */
   char process_name[16];      /* Name of the main thread */
   struct thread* main_thread; /* Pointer to main thread */
+  struct list child_list;
+  struct wait_status* wait_st; /* pointer to this process’s wait status. */
+  struct file* fd_table[MAX_FDS]; /* File descriptor table  */
+  struct file* exec; /* pointer to the executable file (write-denied while running) */
+  struct lock pcb_lock;
+  struct dir* cwd; /* Current working directory */
 };
 
+struct init_status {
+   /* Used in process_fork */
+   struct thread* parent;
+   const struct intr_frame* if_;
+   /* Used in process_execute */
+   char* file_name;
+   /* Semaphore used to synchronize process_execute */
+   struct semaphore load_sema;
+   bool load_success;
+   struct list* list_of_parent;
+ };
+
+/* A struct contains information for wait*/
+struct wait_status {
+   pid_t pid;
+   /* Semaphore used to synchronize process_wait */
+   struct semaphore wait_sema;
+   /* Since a wait_status is owned both by child and parent, 
+      this variable is used for deciding who should free this struct.
+      It can only be 0, 1 or 2. */
+   uint8_t ref_cnt;
+   /* Indicate whether the process that 
+      calls wait has already called wait on pid */
+   bool waited;
+   /* A lock for shared variables */
+   struct lock lck;
+   int exit_code;
+   struct list_elem elem;
+};
+ 
 void userprog_init(void);
 
 pid_t process_execute(const char* file_name);

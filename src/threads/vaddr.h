@@ -12,7 +12,7 @@
    See pte.h for functions and macros specifically for x86
    hardware page tables. */
 
-#define BITMASK(SHIFT, CNT) (((1ul << (CNT)) - 1) << (SHIFT))
+#define BITMASK(SHIFT, CNT) (((1ul << (CNT)) - 1) << (SHIFT)) // Returns a mask 00...00 11...1(CNT) 00...00(SHIFT)
 
 /* Page offset (bits 0:12). */
 #define PGSHIFT 0                       /* Index of first offset bit. */

@@ -51,7 +51,7 @@
 struct tss {
   uint16_t back_link, : 16;
   void* esp0;         /* Ring 0 stack virtual address. */
-  uint16_t ss0, : 16; /* Ring 0 stack segment selector. */
+  uint16_t ss0, : 16; /* Ring 0 stack segment selector. Usually points to SEL_KDSEG */
   void* esp1;
   uint16_t ss1, : 16;
   void* esp2;

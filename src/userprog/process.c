@@ -2,6 +2,7 @@
 #include <debug.h>
 #include <inttypes.h>
 #include <round.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,11 +76,14 @@ static void start_process(void* file_name_) {
   char* file_name = (char*)file_name_;
   struct thread* t = thread_current();
   struct intr_frame if_;
-  bool success, pcb_success;
+  bool success, pcb_success, wait_st_success;
 
   /* Allocate process control block */
   struct process* new_pcb = malloc(sizeof(struct process));
-  success = pcb_success = new_pcb != NULL;
+  struct wait_status* wait_st = malloc(sizeof(struct wait_status));
+  pcb_success = new_pcb != NULL;
+  wait_st_success = wait_st != NULL;
+  success = pcb_success && wait_st_success; 
 
   /* Initialize process control block */
   if (success) {
@@ -90,7 +94,12 @@ static void start_process(void* file_name_) {
 
     // Continue initializing the PCB as normal
     t->pcb->main_thread = t;
+    t->pcb->cwd = dir_open_root();
+    lock_init(&t->pcb->pcb_lock);
+
     strlcpy(t->pcb->process_name, t->name, sizeof t->name);
+    t->pcb->wait_st = wait_st;
+    list_init(&(t->pcb->child_list));
   }
 
   /* Initialize interrupt frame and load executable. */
@@ -100,6 +109,26 @@ static void start_process(void* file_name_) {
     if_.cs = SEL_UCSEG;
     if_.eflags = FLAG_IF | FLAG_MBS;
     success = load(file_name, &if_.eip, &if_.esp);
+  }
+
+  /* Initialize the wait_status*/
+  if (success) {
+    wait_st = t->pcb->wait_st;
+    wait_st->pid = t->tid;
+    sema_init(&(wait_st->wait_sema), 0);
+    wait_st->waited = false;
+    lock_init(&(wait_st->lck));
+    /* Reference by parent and child */
+    wait_st->ref_cnt = 2;
+    list_push_back(init_st->list_of_parent, &(wait_st->elem));
+
+    for (int i = 0; i < MAX_FDS; i++) {
+      t->pcb->fd_table[i] = NULL;
+    }
+  }
+
+  if (!success && wait_st_success) {
+    free(wait_st);
   }
 
   /* Handle failure with succesful PCB malloc. Must free the PCB */
@@ -129,6 +158,92 @@ static void start_process(void* file_name_) {
   NOT_REACHED();
 }
 
+static void copy_process(void* aux) {
+  struct init_status* init_st = (struct init_status*)aux;
+  struct thread* parent = init_st->parent;
+  struct thread* t = thread_current();
+  struct process* new_pcb = malloc(sizeof(struct process));
+  struct wait_status* wait_st = malloc(sizeof(struct wait_status));
+  struct intr_frame if_;
+
+  bool success, pcb_success, wait_st_success;
+  pcb_success = new_pcb != NULL;
+  wait_st_success = wait_st != NULL;
+  success = pcb_success && wait_st_success;
+
+  if (success) {
+    // Ensure that timer_interrupt() -> schedule() -> process_activate()
+    // does not try to activate our uninitialized pagedir
+    new_pcb->pagedir = NULL;
+    t->pcb = new_pcb;
+
+    t->pcb = new_pcb;
+    t->pcb->cwd = dir_reopen(parent->pcb->cwd);
+    strlcpy(t->pcb->process_name, parent->name, sizeof t->name);
+    t->pcb->wait_st = wait_st;
+    list_init(&(t->pcb->child_list));
+
+    for (int i = 0; i < MAX_FDS; i++) {
+      t->pcb->fd_table[i] = duplicate_file(parent->pcb->fd_table[i]);
+    }
+    t->pcb->exec = duplicate_file(parent->pcb->exec);
+    
+    if (t->pcb->exec == NULL) {
+      success = false;
+      goto done;
+    }
+    
+    process_activate();
+    if (!copy_page_table(t->pcb->pagedir, parent->pcb->pagedir)) {
+      success = true;
+      goto done;
+    }
+
+    /* Initialize wait_status */
+    wait_st = t->pcb->wait_st;
+    wait_st->pid = t->tid;
+    sema_init(&(wait_st->wait_sema), 0);
+    wait_st->waited = false;
+    lock_init(&(wait_st->lck));
+    /* Reference by parent and child */
+    wait_st->ref_cnt = 2;
+    list_push_back(init_st->list_of_parent, &(wait_st->elem));
+
+    memcpy(&if_, init_st->if_, sizeof(if_));
+    if_.eax = 0;
+
+  }
+
+done:
+  if (!success && wait_st_success) {
+    free(wait_st);
+  }
+
+  /* Handle failure with succesful PCB malloc. Must free the PCB */
+  if (!success && pcb_success) {
+    uint32_t* pd = t->pcb->pagedir;
+    if (pd != NULL) {
+      t->pcb->pagedir = NULL;
+      pagedir_activate(NULL);
+      pagedir_destroy(pd);
+    }
+    // Avoid race where PCB is freed before t->pcb is set to NULL
+    // If this happens, then an unfortuantely timed timer interrupt
+    // can try to activate the pagedir, but it is now freed memory
+    struct process* pcb_to_free = t->pcb;
+    t->pcb = NULL;
+    free(pcb_to_free);
+  }
+  init_st->load_success = success;
+  sema_up(&(init_st->load_sema));
+  if (!success) {
+    thread_exit();
+  }
+
+  asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
+  NOT_REACHED();
+}
+
 /* Waits for process with PID child_pid to die and returns its exit status.
    If it was terminated by the kernel (i.e. killed due to an
    exception), returns -1.  If child_pid is invalid or if it was not a
@@ -141,6 +256,39 @@ static void start_process(void* file_name_) {
 int process_wait(pid_t child_pid UNUSED) {
   sema_down(&temporary);
   return 0;
+}
+
+pid_t process_fork(const struct intr_frame* if_) {
+  tid_t tid;
+  bool success;
+  struct init_status* init_st = malloc(sizeof(struct init_status));
+  if (init_st == NULL) {
+    return TID_ERROR;
+  }
+
+  struct thread* cur = thread_current();
+  ASSERT(cur->pcb != NULL);
+  sema_init(&(init_st->load_sema), 0);
+  init_st->if_ = if_;
+  init_st->parent = cur;
+  init_st->list_of_parent = &(thread_current()->pcb->child_list);
+
+  tid = thread_create(cur->name, PRI_DEFAULT, copy_process, init_st);
+  success = (tid != TID_ERROR);
+  if (tid == TID_ERROR) {
+    goto done;
+  }
+
+  sema_down(&(init_st->load_sema));
+  success = init_st->load_success;
+
+done:
+  free(init_st);
+  if (success) {
+    return tid;
+  } else {
+    return TID_ERROR;
+  }
 }
 
 /* Free the current process's resources. */
@@ -259,10 +407,11 @@ struct Elf32_Phdr {
 #define PF_W 2 /* Writable. */
 #define PF_R 4 /* Readable. */
 
-static bool setup_stack(void** esp);
+static bool setup_stack(void** esp, int argc, char **argv);
 static bool validate_segment(const struct Elf32_Phdr*, struct file*);
 static bool load_segment(struct file* file, off_t ofs, uint8_t* upage, uint32_t read_bytes,
                          uint32_t zero_bytes, bool writable);
+
 
 /* Loads an ELF executable from FILE_NAME into the current thread.
    Stores the executable's entry point into *EIP
@@ -275,6 +424,10 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
   off_t file_ofs;
   bool success = false;
   int i;
+  char* saveptr = NULL;
+  char* argv[MAX_ARGC];
+  int argc = 0;
+  char* token = NULL;
 
   /* Allocate and activate page directory. */
   t->pcb->pagedir = pagedir_create();
@@ -283,6 +436,14 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
   process_activate();
 
   /* Open executable file. */
+
+  argv[0] = strtok_r(file_name, " ", &saveptr);
+  argc += 1;
+  if (argv[0] == NULL) {
+    printf("load: file name is empty\n");
+    goto done;
+  }
+
   file = filesys_open(file_name);
   if (file == NULL) {
     printf("load: %s: open failed\n", file_name);
@@ -348,7 +509,17 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
   }
 
   /* Set up stack. */
-  if (!setup_stack(esp))
+  while (((argc < MAX_ARGC) && (token = strtok_r(NULL, " ", &saveptr)) != NULL)) {
+    argv[argc] = token;
+    argc++;
+  }
+
+  if ((argc >= MAX_ARGC) && strtok_r(NULL, " ", &saveptr) != NULL) {
+    printf("load: exceed max arguments number %d\n", MAX_ARGC);
+    goto done;
+  }
+
+  if (!setup_stack(esp, argc, argv))
     goto done;
 
   /* Start address. */
@@ -465,19 +636,63 @@ static bool load_segment(struct file* file, off_t ofs, uint8_t* upage, uint32_t 
 
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
-static bool setup_stack(void** esp) {
+static bool setup_stack(void** esp, int argc, char **argv) {
   uint8_t* kpage;
   bool success = false;
+  const uintptr_t STACK_BOTTOM = (uintptr_t)PHYS_BASE - PGSIZE; // esp should be greater than this.
+  // Here, we need to save the argument address so that the pop process can go on properly
+  char* user_argv[MAX_ARGC];
 
   kpage = palloc_get_page(PAL_USER | PAL_ZERO);
-  if (kpage != NULL) {
-    success = install_page(((uint8_t*)PHYS_BASE) - PGSIZE, kpage, true);
-    if (success)
-      *esp = PHYS_BASE;
-    else
-      palloc_free_page(kpage);
+  if (!kpage) {
+    printf("setup_stack: No free page\n");
+    return false;
   }
-  return success;
+
+  success = install_page(((uint8_t*)PHYS_BASE) - PGSIZE, kpage, true);
+  if (!success) {
+    palloc_free_page(kpage);
+    printf("setup_stack: Can't install page\n");
+    return false;
+  }
+
+  *esp = PHYS_BASE;
+  for (int i = argc - 1; i >= 0; i--) {
+    size_t len = strlen(argv[i]) + 1;
+    if ((uintptr_t)*esp - len < STACK_BOTTOM) {
+      goto fail;
+    }
+    *esp = *esp - len;
+    strlcpy(*esp, argv[i], len);
+    user_argv[i] = *esp;
+  }
+
+  size_t args_size = sizeof(char*) * (argc + 1) + sizeof(char**) + sizeof(int);
+  uintptr_t new_esp = (uintptr_t)*esp - args_size;
+  size_t padding = new_esp - ROUND_DOWN(new_esp, 16);
+  new_esp -= padding;
+  if (new_esp < STACK_BOTTOM) {
+    goto fail;
+  }
+  *esp = *esp - padding - sizeof(char*);
+
+  for (int i = argc - 1; i >= 0; i--) {
+    *esp = *esp - sizeof(char*);
+    *((char**)*esp) = user_argv[i];
+  }
+  char** argv_ptr = *esp;
+  *esp = *esp - sizeof(char**);
+  *((char***)*esp) = argv_ptr;
+
+  *esp = *esp - sizeof(int);
+  *((int*)*esp) = argc;
+  *esp = *esp - sizeof(void*);
+  return true;
+
+fail:
+  palloc_free_page(kpage);
+  printf("setup_stack: Exceed allocated stack\n");
+  return false;
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel
