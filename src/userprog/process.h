@@ -82,4 +82,6 @@ tid_t pthread_join(tid_t);
 void pthread_exit(void);
 void pthread_exit_main(void);
 
+pid_t process_fork(const struct intr_frame* if_);
+
 #endif /* userprog/process.h */

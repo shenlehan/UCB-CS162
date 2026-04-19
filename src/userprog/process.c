@@ -27,6 +27,9 @@ static thread_func start_pthread NO_RETURN;
 static bool load(const char* file_name, void (**eip)(void), void** esp);
 bool setup_thread(void (**eip)(void), void** esp);
 
+/* Copy page_table from parent to child*/
+bool copy_page_table(uint32_t* child_pagedir, uint32_t* parent_pagedir);
+
 /* Initializes user programs in the system by ensuring the main
    thread has a minimal PCB so that it can execute and wait for
    the first user process. Any additions to the PCB should be also
@@ -777,3 +780,22 @@ void pthread_exit(void) {}
    This function will be implemented in Project 2: Multithreading. For
    now, it does nothing. */
 void pthread_exit_main(void) {}
+
+/* Copy page_table from parent to child*/
+bool copy_page_table(uint32_t* child_pagedir, uint32_t* parent_pagedir) {
+  for (uint8_t* addr = 0; addr < (uint8_t*)PHYS_BASE; addr += PGSIZE) {
+    if (pagedir_get_page(parent_pagedir, addr)) {
+      void* page = palloc_get_page(PAL_USER);
+      bool writable = page_is_writable(parent_pagedir, addr);
+      if (page == NULL)
+        return false;
+
+      memcpy(page, pagedir_get_page(parent_pagedir, addr), PGSIZE);
+      if (!pagedir_set_page(child_pagedir, addr, page, writable)) {
+        palloc_free_page(page);
+        return false;
+      }
+    }
+  }
+  return true;
+}

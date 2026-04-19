@@ -8,6 +8,7 @@ struct file {
   struct inode* inode; /* File's inode. */
   off_t pos;           /* Current position. */
   bool deny_write;     /* Has file_deny_write() been called? */
+  int ref_cnt;         /* Multiple processes could share a same file */
 };
 
 /* Opens a file for the given INODE, of which it takes ownership,
@@ -36,9 +37,12 @@ struct file* file_reopen(struct file* file) {
 /* Closes FILE. */
 void file_close(struct file* file) {
   if (file != NULL) {
-    file_allow_write(file);
-    inode_close(file->inode);
-    free(file);
+    file->ref_cnt--;
+    if (file->ref_cnt == 0) {
+      file_allow_write(file);
+      inode_close(file->inode);
+      free(file);
+    }
   }
 }
 
@@ -131,4 +135,14 @@ void file_seek(struct file* file, off_t new_pos) {
 off_t file_tell(struct file* file) {
   ASSERT(file != NULL);
   return file->pos;
+}
+
+/* Duplicate a shared file*, used for fork */
+struct file* duplicate_file(struct file* file) {
+  struct file* dup = file;
+  if (dup == NULL) {
+    return NULL;
+  }
+  file->ref_cnt++;
+  return dup;
 }
